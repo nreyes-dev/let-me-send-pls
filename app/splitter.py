@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import re
-import shutil
 import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -11,7 +10,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 SAFETY_FRACTION = 0.92
-DEFAULT_AUDIO_KBPS = 128
+AUDIO_KBPS = 128
+KEYFRAME_SEC = 2
 
 ProgressCallback = Callable[[float, str], None]
 
@@ -48,6 +48,7 @@ class Splitter(ABC):
 
 class VideoSplitter(Splitter):
     THUMB_SIZE = 180
+    _encoder: Optional[tuple[str, int]] = None
 
     @staticmethod
     def supported_extensions() -> set[str]:
@@ -55,6 +56,20 @@ class VideoSplitter(Splitter):
             ".mp4", ".mov", ".avi", ".mkv", ".webm",
             ".flv", ".wmv", ".m4v", ".ts", ".mts",
         }
+
+    @classmethod
+    def _pick_encoder(cls) -> tuple[str, int]:
+        """Return (encoder, crf). Prefer H.265 for ~40-50% better compression."""
+        if cls._encoder is None:
+            r = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True, text=True,
+            )
+            if "libx265" in r.stdout:
+                cls._encoder = ("libx265", 28)
+            else:
+                cls._encoder = ("libx264", 23)
+        return cls._encoder
 
     @staticmethod
     def _probe(path: Path) -> dict:
@@ -85,6 +100,85 @@ class VideoSplitter(Splitter):
             capture_output=True, check=False,
         )
 
+    # ------------------------------------------------------------------
+
+    def _compress(
+        self,
+        src: Path,
+        dst: Path,
+        duration: float,
+        on_progress: Optional[ProgressCallback],
+    ) -> Optional[str]:
+        """Compress video to H.265 (or H.264 fallback) MP4 with CRF.
+
+        Returns None on success, or an error string.
+        """
+        encoder, crf = self._pick_encoder()
+        codec_label = encoder.replace("lib", "").upper()
+        tag_args = ["-tag:v", "hvc1"] if encoder == "libx265" else []
+        extra = ["-x265-params", "log-level=error"] if encoder == "libx265" else []
+
+        cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-i", str(src),
+            "-c:v", encoder, "-crf", str(crf),
+            "-preset", "medium", "-pix_fmt", "yuv420p",
+            *tag_args, *extra,
+            "-force_key_frames",
+            f"expr:gte(t,n_forced*{KEYFRAME_SEC})",
+            "-c:a", "aac", "-b:a", f"{AUDIO_KBPS}k", "-ac", "2",
+            "-movflags", "+faststart",
+            "-progress", "pipe:1",
+            str(dst),
+        ]
+
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+        time_re = re.compile(r"out_time_us=(\d+)")
+        if proc.stdout:
+            for line in proc.stdout:
+                m = time_re.search(line)
+                if m and duration > 0 and on_progress:
+                    raw = min(int(m.group(1)) / (duration * 1e6), 1.0)
+                    pct = raw * 0.88
+                    on_progress(
+                        pct,
+                        f"Compressing ({codec_label})\u2026 {raw * 100:.0f}%",
+                    )
+
+        proc.wait()
+        if proc.returncode != 0:
+            err = proc.stderr.read() if proc.stderr else ""
+            return err[-800:]
+        return None
+
+    @staticmethod
+    def _segment_copy(
+        src: Path, output_dir: Path, prefix: str, seg_dur: float,
+    ) -> Optional[str]:
+        """Split an already-compressed file with stream copy (fast, no re-encode).
+
+        Returns None on success, or an error string.
+        """
+        pattern = str(output_dir / f"{prefix}_part%03d.mp4")
+        cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-i", str(src),
+            "-c", "copy",
+            "-f", "segment",
+            "-segment_time", str(seg_dur),
+            "-reset_timestamps", "1",
+            pattern,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            return r.stderr[-800:]
+        return None
+
+    # ------------------------------------------------------------------
+
     def split(
         self,
         input_path: Path,
@@ -101,77 +195,62 @@ class VideoSplitter(Splitter):
 
         fmt = info.get("format", {})
         duration = float(fmt.get("duration", 0))
-        file_size = int(fmt.get("size", 0))
 
-        if duration <= 0 or file_size <= 0:
-            return SplitResult(error="Cannot determine video duration or file size.")
+        if duration <= 0:
+            return SplitResult(error="Cannot determine video duration.")
 
         target_bytes = int(max_size_mb * 1024 * 1024)
+        prefix = input_path.stem
 
-        if file_size <= target_bytes:
-            dest = output_dir / f"{input_path.stem}_part000.mp4"
-            shutil.copy2(input_path, dest)
+        # Phase 1 — compress to the most efficient format (CRF = best
+        # quality-per-byte; H.265 when available, H.264 fallback).
+        compressed = output_dir / f".{prefix}_compressed.mp4"
+        if on_progress:
+            on_progress(0.0, "Compressing\u2026")
+
+        err = self._compress(input_path, compressed, duration, on_progress)
+        if err is not None:
+            compressed.unlink(missing_ok=True)
+            return SplitResult(error=f"Compression failed:\n{err}")
+
+        comp_size = compressed.stat().st_size
+
+        # Phase 2a — already fits in a single part after compression.
+        if comp_size <= target_bytes:
+            dest = output_dir / f"{prefix}_part000.mp4"
+            compressed.rename(dest)
+            if on_progress:
+                on_progress(0.95, "Generating preview\u2026")
             thumb = output_dir / ".thumbs" / f"{dest.stem}.jpg"
             self._thumbnail(dest, thumb)
+            if on_progress:
+                on_progress(1.0, "Done \u2014 fits in 1 part!")
             return SplitResult(parts=[
-                SplitPart(path=dest, thumbnail=thumb, size_bytes=dest.stat().st_size),
+                SplitPart(
+                    path=dest,
+                    thumbnail=thumb if thumb.exists() else None,
+                    size_bytes=dest.stat().st_size,
+                ),
             ])
 
-        n_parts = math.ceil(file_size / target_bytes)
+        # Phase 2b — split the compressed file with stream copy (fast).
+        n_parts = math.ceil(comp_size / (target_bytes * SAFETY_FRACTION))
         seg_dur = duration / n_parts
-        audio_kbps = DEFAULT_AUDIO_KBPS
-        total_kbps = max(200.0, (target_bytes * 8 / seg_dur) / 1000 * SAFETY_FRACTION)
-        video_kbps = max(100.0, total_kbps - audio_kbps - 64)
+        if on_progress:
+            on_progress(0.90, f"Splitting into {n_parts} parts\u2026")
 
-        prefix = input_path.stem
-        pattern = str(output_dir / f"{prefix}_part%03d.mp4")
-
-        cmd = [
-            "ffmpeg", "-hide_banner", "-y",
-            "-i", str(input_path),
-            "-c:v", "libx264", "-preset", "veryfast",
-            "-profile:v", "high", "-pix_fmt", "yuv420p",
-            "-b:v", f"{video_kbps:.0f}k",
-            "-maxrate", f"{video_kbps:.0f}k",
-            "-bufsize", f"{int(video_kbps * 2)}k",
-            "-g", "48", "-keyint_min", "48", "-sc_threshold", "0",
-            "-force_key_frames", f"expr:gte(t,n_forced*{seg_dur})",
-            "-c:a", "aac", "-b:a", f"{audio_kbps}k", "-ac", "2",
-            "-movflags", "+faststart",
-            "-f", "segment", "-segment_time", str(seg_dur),
-            "-reset_timestamps", "1",
-            "-progress", "pipe:1",
-            pattern,
-        ]
-
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-
-        time_re = re.compile(r"out_time_us=(\d+)")
-        if proc.stdout:
-            for line in proc.stdout:
-                m = time_re.search(line)
-                if m and duration > 0:
-                    us = int(m.group(1))
-                    pct = min(us / (duration * 1_000_000), 0.95)
-                    if on_progress:
-                        on_progress(pct, f"Encoding\u2026 {pct * 100:.0f}%")
-
-        proc.wait()
-
-        if proc.returncode != 0:
-            err = proc.stderr.read() if proc.stderr else ""
-            return SplitResult(
-                error=f"ffmpeg failed (code {proc.returncode}):\n{err[-800:]}"
-            )
+        err = self._segment_copy(compressed, output_dir, prefix, seg_dur)
+        compressed.unlink(missing_ok=True)
+        if err is not None:
+            return SplitResult(error=f"Split failed:\n{err}")
 
         parts = sorted(output_dir.glob(f"{prefix}_part*.mp4"))
         if not parts:
-            return SplitResult(error="ffmpeg produced no output files.")
+            return SplitResult(error="No output files produced.")
 
+        # Phase 3 — thumbnails.
         if on_progress:
-            on_progress(0.97, "Generating previews\u2026")
+            on_progress(0.95, "Generating previews\u2026")
 
         result_parts: list[SplitPart] = []
         for p in parts:
