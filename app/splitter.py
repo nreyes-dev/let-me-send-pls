@@ -4,6 +4,7 @@ import json
 import math
 import re
 import subprocess
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -136,6 +137,18 @@ class VideoSplitter(Splitter):
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
 
+        # Drain stderr in a background thread to prevent the OS pipe
+        # buffer from filling up and deadlocking ffmpeg.
+        stderr_chunks: list[str] = []
+
+        def _drain_stderr():
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                stderr_chunks.append(line)
+
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
         time_re = re.compile(r"out_time_us=(\d+)")
         if proc.stdout:
             for line in proc.stdout:
@@ -149,9 +162,10 @@ class VideoSplitter(Splitter):
                     )
 
         proc.wait()
+        stderr_thread.join(timeout=5)
+
         if proc.returncode != 0:
-            err = proc.stderr.read() if proc.stderr else ""
-            return err[-800:]
+            return "".join(stderr_chunks)[-800:]
         return None
 
     @staticmethod
