@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 import subprocess
 import threading
@@ -169,20 +168,42 @@ class VideoSplitter(Splitter):
         return None
 
     @staticmethod
-    def _segment_copy(
-        src: Path, output_dir: Path, prefix: str, seg_dur: float,
-    ) -> Optional[str]:
-        """Split an already-compressed file with stream copy (fast, no re-encode).
+    def _keyframe_positions(src: Path) -> list[tuple[float, int]]:
+        """Return [(timestamp, byte_offset)] for every video keyframe."""
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-skip_frame", "nokey",
+            "-show_entries", "frame=pts_time,pkt_pos",
+            "-of", "csv=p=0",
+            str(src),
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result: list[tuple[float, int]] = []
+        for line in r.stdout.strip().split("\n"):
+            if not line:
+                continue
+            cols = line.split(",")
+            if len(cols) >= 2:
+                try:
+                    result.append((float(cols[0]), int(cols[1])))
+                except (ValueError, IndexError):
+                    continue
+        return result
 
-        Returns None on success, or an error string.
-        """
+    @staticmethod
+    def _split_at_times(
+        src: Path, output_dir: Path, prefix: str, times: list[float],
+    ) -> Optional[str]:
+        """Stream-copy split at the given timestamps (fast, no re-encode)."""
         pattern = str(output_dir / f"{prefix}_part%03d.mp4")
+        times_str = ",".join(f"{t:.6f}" for t in times)
         cmd = [
             "ffmpeg", "-hide_banner", "-y",
             "-i", str(src),
             "-c", "copy",
             "-f", "segment",
-            "-segment_time", str(seg_dur),
+            "-segment_times", times_str,
             "-reset_timestamps", "1",
             pattern,
         ]
@@ -190,6 +211,34 @@ class VideoSplitter(Splitter):
         if r.returncode != 0:
             return r.stderr[-800:]
         return None
+
+    def _compute_split_times(
+        self, src: Path, target_bytes: int,
+    ) -> list[float]:
+        """Analyze keyframe byte offsets and find where to cut so each
+        segment stays within *target_bytes* (with a small margin for
+        per-segment container overhead)."""
+        keyframes = self._keyframe_positions(src)
+        if len(keyframes) < 2:
+            return []
+
+        budget = int(target_bytes * 0.98)  # 2 % margin for moov overhead
+        split_times: list[float] = []
+        last_split_pos = keyframes[0][1]
+        prev_kf = keyframes[0]
+
+        for ts, pos in keyframes[1:]:
+            if pos - last_split_pos >= budget:
+                if prev_kf[1] > last_split_pos:
+                    split_times.append(prev_kf[0])
+                    last_split_pos = prev_kf[1]
+                else:
+                    # Single GOP exceeds budget — accept the oversized segment
+                    split_times.append(ts)
+                    last_split_pos = pos
+            prev_kf = (ts, pos)
+
+        return split_times
 
     # ------------------------------------------------------------------
 
@@ -247,13 +296,19 @@ class VideoSplitter(Splitter):
                 ),
             ])
 
-        # Phase 2b — split the compressed file with stream copy (fast).
-        n_parts = math.ceil(comp_size / (target_bytes * SAFETY_FRACTION))
-        seg_dur = duration / n_parts
+        # Phase 2b — analyze keyframe byte positions and split by size.
+        if on_progress:
+            on_progress(0.89, "Analyzing\u2026")
+
+        split_times = self._compute_split_times(compressed, target_bytes)
+        n_parts = len(split_times) + 1
+
         if on_progress:
             on_progress(0.90, f"Splitting into {n_parts} parts\u2026")
 
-        err = self._segment_copy(compressed, output_dir, prefix, seg_dur)
+        err = self._split_at_times(
+            compressed, output_dir, prefix, split_times,
+        )
         compressed.unlink(missing_ok=True)
         if err is not None:
             return SplitResult(error=f"Split failed:\n{err}")
