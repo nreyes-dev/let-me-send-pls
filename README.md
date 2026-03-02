@@ -15,7 +15,7 @@ Fixes "file too large" so you can just send it. A desktop app that splits videos
 
 | Platform  | Tier         | Max size per part |
 |-----------|--------------|-------------------|
-| Discord   | Free         | 25 MB             |
+| Discord   | Free         | 10 MB             |
 | Discord   | Nitro Basic  | 50 MB             |
 | Discord   | Nitro        | 500 MB            |
 | Slack     | All plans    | 1 GB              |

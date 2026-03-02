@@ -19,7 +19,7 @@ class PlatformTier:
 
 
 PLATFORM_TIERS: list[PlatformTier] = [
-    PlatformTier("Discord", "Free", 25),
+    PlatformTier("Discord", "Free", 10),
     PlatformTier("Discord", "Nitro Basic", 50),
     PlatformTier("Discord", "Nitro", 500),
     PlatformTier("Slack", "All plans", 1000),
