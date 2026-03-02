@@ -23,7 +23,7 @@ PLATFORM_TIERS: list[PlatformTier] = [
     PlatformTier("Discord", "Nitro Basic", 50),
     PlatformTier("Discord", "Nitro", 500),
     PlatformTier("Slack", "All plans", 1000),
-    PlatformTier("WhatsApp", "Standard", 64),
+    PlatformTier("WhatsApp", "Standard", 180),
 ]
 
 PLATFORM_NAMES: list[str] = list(dict.fromkeys(p.platform for p in PLATFORM_TIERS))

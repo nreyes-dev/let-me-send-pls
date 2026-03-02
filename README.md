@@ -19,7 +19,7 @@ Fixes "file too large" so you can just send it. A desktop app that splits videos
 | Discord   | Nitro Basic  | 50 MB             |
 | Discord   | Nitro        | 500 MB            |
 | Slack     | All plans    | 1 GB              |
-| WhatsApp  | Standard     | 64 MB             |
+| WhatsApp  | Standard     | 180 MB            |
 
 ## Prerequisites
 
